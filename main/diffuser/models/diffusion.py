@@ -1191,6 +1191,94 @@ class TransCondGaussianDiffusion_plan9a(TransCondGaussianDiffusion_plan9):
         re_weight = torch.FloatTensor([1 for i in range(Configs.horizon)]).to(Configs.device).reshape(1,1,Configs.horizon)
         traj_reduce_weight = 1/re_weight
         return  traj_reduce_weight #/torch.sum(traj_reduce_weight, -1)
+
+    def _pad_or_trim_horizon(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] > Configs.horizon:
+            return x[:, :Configs.horizon]
+        if x.shape[1] < Configs.horizon:
+            tail = x[:, -1:].repeat(1, Configs.horizon - x.shape[1])
+            return torch.cat([x, tail], dim=1)
+        return x
+
+    def _extract_anchor_values(self, anchor_vals, batch_size: int, device: torch.device):
+        if anchor_vals is None:
+            return None
+        if not torch.is_tensor(anchor_vals):
+            anchor_vals = torch.as_tensor(anchor_vals, device=device, dtype=torch.float32)
+        else:
+            anchor_vals = anchor_vals.to(device=device, dtype=torch.float32)
+
+        if anchor_vals.ndim == 3 and anchor_vals.shape[-1] == 1:
+            anchor_vals = anchor_vals.squeeze(-1)
+        if anchor_vals.ndim != 2 or anchor_vals.shape[0] != batch_size:
+            return None
+        return self._pad_or_trim_horizon(anchor_vals)
+
+    def _extract_cf_values(self, cf_vals, batch_size: int, device: torch.device):
+        if cf_vals is None:
+            return None
+        if not torch.is_tensor(cf_vals):
+            cf_vals = torch.as_tensor(cf_vals, device=device, dtype=torch.float32)
+        else:
+            cf_vals = cf_vals.to(device=device, dtype=torch.float32)
+
+        if cf_vals.ndim == 4 and cf_vals.shape[-1] == 1:
+            cf_vals = cf_vals.squeeze(-1)
+
+        if cf_vals.ndim == 3:
+            if cf_vals.shape[0] != batch_size:
+                return None
+            k = int(getattr(Configs, "counterfactual_k", 0) or 0)
+            if k > 0:
+                k = max(1, min(k, cf_vals.shape[1]))
+                cf_vals = cf_vals[:, :k, :]
+            cf_vals = cf_vals.mean(dim=1)
+        elif cf_vals.ndim == 2:
+            if cf_vals.shape[0] != batch_size:
+                return None
+        else:
+            return None
+
+        return self._pad_or_trim_horizon(cf_vals)
+
+    def _compute_credit_weights(self, positives_vals, negatives_vals, anchor_vals, batch_size: int, device: torch.device):
+        ones = torch.ones((batch_size, Configs.horizon), device=device, dtype=torch.float32)
+        if not bool(getattr(Configs, "use_counterfactual_credit", 0)):
+            return ones, False
+
+        anchor_seq = self._extract_anchor_values(anchor_vals, batch_size, device)
+        positive_seq = self._extract_cf_values(positives_vals, batch_size, device)
+        negative_seq = self._extract_cf_values(negatives_vals, batch_size, device)
+
+        mode = str(getattr(Configs, "credit_weight_mode", "anchor_minus_negative")).lower()
+        if mode == "positive_minus_negative" and positive_seq is not None and negative_seq is not None:
+            credit = positive_seq - negative_seq
+        elif mode == "anchor_minus_negative" and anchor_seq is not None and negative_seq is not None:
+            credit = anchor_seq - negative_seq
+        elif anchor_seq is not None and negative_seq is not None:
+            credit = anchor_seq - negative_seq
+        elif positive_seq is not None and negative_seq is not None:
+            credit = positive_seq - negative_seq
+        else:
+            return ones, False
+
+        norm = str(getattr(Configs, "credit_weight_norm", "signed")).lower()
+        if norm == "zscore":
+            mean = credit.mean(dim=1, keepdim=True)
+            std = credit.std(dim=1, keepdim=True).clamp(min=1e-6)
+            credit_norm = (credit - mean) / std
+        elif norm == "tanh":
+            credit_norm = torch.tanh(credit)
+        else:
+            scale = credit.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+            credit_norm = credit / scale
+
+        alpha = float(getattr(Configs, "credit_weight_alpha", 1.0))
+        min_w = float(getattr(Configs, "credit_weight_min", 0.2))
+        max_w = float(getattr(Configs, "credit_weight_max", 2.0))
+        weights = torch.clamp(1.0 + alpha * credit_norm, min=min_w, max=max_w)
+        return weights, True
+
     def p_losses(self, x_start, cond, positives, negatives, positives_vals, negatives_vals,  history,  t  ):
 
         noise = torch.randn_like(x_start)
@@ -1206,16 +1294,34 @@ class TransCondGaussianDiffusion_plan9a(TransCondGaussianDiffusion_plan9):
 
         assert noise.shape == x_recon.shape
 
-        
-        if self.predict_epsilon:
-            loss, info = self.loss_fn(x_recon, noise)
+        credit_weights, credit_enabled = self._compute_credit_weights(
+            positives_vals=positives_vals,
+            negatives_vals=negatives_vals,
+            anchor_vals=history,
+            batch_size=x_start.shape[0],
+            device=x_start.device,
+        )
+
+        target = noise if self.predict_epsilon else x_start
+        use_credit_diff = bool(credit_enabled and int(getattr(Configs, "credit_weight_on_diffusion", 1)) == 1)
+        if use_credit_diff and hasattr(self.loss_fn, "_loss") and hasattr(self.loss_fn, "weights"):
+            elem_loss = self.loss_fn._loss(x_recon, target)
+            step_dim_weights = self.loss_fn.weights.to(elem_loss.device).unsqueeze(0)
+            loss = (elem_loss * step_dim_weights * credit_weights.unsqueeze(-1)).mean()
+            a0_base = step_dim_weights[:, 0, :self.action_dim].clamp(min=1e-6)
+            info = {"a0_loss": (elem_loss[:, 0, :self.action_dim] / a0_base).mean()}
         else:
-            loss, info = self.loss_fn(x_recon, x_start)
+            loss, info = self.loss_fn(x_recon, target)
 
 
         # if Configs.reduce_method == "mean":
-        reduc_weight_posi = torch.ones( x_start.shape[0], Configs.subbatchsize ).to(Configs.device) / Configs.subbatchsize
-        reduc_weight_nega = torch.ones( x_start.shape[0], Configs.subbatchsize ).to(Configs.device) / Configs.subbatchsize
+        reduc_weight_posi = torch.ones(x_start.shape[0], Configs.subbatchsize, device=x_start.device) / Configs.subbatchsize
+        reduc_weight_nega = torch.ones(x_start.shape[0], Configs.subbatchsize, device=x_start.device) / Configs.subbatchsize
+        traj_reduce_weight = self.traj_reduce_weight
+        use_credit_cons = bool(credit_enabled and int(getattr(Configs, "credit_weight_on_contrast", 1)) == 1)
+        if use_credit_cons:
+            traj_reduce_weight = credit_weights.unsqueeze(1)
+            traj_reduce_weight = traj_reduce_weight / traj_reduce_weight.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
         # always state level
         if Configs.conembver == "traj":  
@@ -1227,7 +1333,14 @@ class TransCondGaussianDiffusion_plan9a(TransCondGaussianDiffusion_plan9):
             x_recon_embd  = self.contrastive_embd_layer( x_recon[:, :, self.action_dim:] )
             positive_embd = self.contrastive_embd_layer( positives )#.mean(1))
             negative_embd = self.contrastive_embd_layer( negatives ) if Configs.lowerbound > 0 else None
-            cons_loss = self.contrastive_loss_fn(x_recon_embd, positive_embd, negative_embd,  reduc_weight_posi = reduc_weight_posi, reduc_weight_nega = reduc_weight_nega , traj_reduce_weight = self.traj_reduce_weight  )
+            cons_loss = self.contrastive_loss_fn(
+                x_recon_embd,
+                positive_embd,
+                negative_embd,
+                reduc_weight_posi=reduc_weight_posi,
+                reduc_weight_nega=reduc_weight_nega,
+                traj_reduce_weight=traj_reduce_weight,
+            )
 
 
 
@@ -1239,6 +1352,10 @@ class TransCondGaussianDiffusion_plan9a(TransCondGaussianDiffusion_plan9):
         info['DiffLoss'] = loss
         info['TotalLoss'] = loss_all
         info['cons_loss'] = cons_loss
+        info['credit_mean'] = float(credit_weights.mean().item())
+        info['credit_min'] = float(credit_weights.min().item())
+        info['credit_max'] = float(credit_weights.max().item())
+        info['credit_used'] = float(1.0 if credit_enabled else 0.0)
 
         return loss_all, info
 

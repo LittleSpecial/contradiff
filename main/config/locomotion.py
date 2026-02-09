@@ -181,6 +181,17 @@ addin = {
         'beta': 0.5,
         'testplan': None,
         "tag": None,
+        "dataset_infos_path": "dataset_infos",
+        "value_of_states_path": "value_of_states",
+        "use_counterfactual_credit": 0,
+        "counterfactual_k": 2,
+        "credit_weight_mode": "anchor_minus_negative",
+        "credit_weight_norm": "signed",
+        "credit_weight_alpha": 1.0,
+        "credit_weight_min": 0.2,
+        "credit_weight_max": 2.0,
+        "credit_weight_on_diffusion": 1,
+        "credit_weight_on_contrast": 1,
 }
 
 base = {

@@ -363,6 +363,7 @@ class MixDataset_plan2_hard(MixDataset_plan1_hard):
     def __init__(self, env='hopper-medium-replay', horizon=64, normalizer='LimitsNormalizer', preprocess_fns=[], max_path_length=1000, max_n_episodes=10000, termination_penalty=0, use_padding=True, seed=None):
         super().__init__(env, horizon, normalizer, preprocess_fns, max_path_length, max_n_episodes, termination_penalty, use_padding, seed)
         self.contrast_place_holder = np.zeros((Configs.subbatchsize, Configs.horizon,self.observation_dim)).astype(np.float32)
+
     def calculate_similarity_in_cluster(self, ):
         nums_clusters = self.cluster_info['nums_clusters']
         samples_per_cluster_idx = self.cluster_info['samples_per_cluster_idx']
@@ -435,10 +436,46 @@ class MixDataset_plan2_hard(MixDataset_plan1_hard):
         
         del self.similarity_in_cluster
         self.positive_hash_table = positive_hash_table
+
+    def _build_trajectory_offsets(self):
+        lengths = np.asarray(self.map_back_lenghts, dtype=np.int64)
+        offsets = np.zeros_like(lengths)
+        if len(lengths) > 1:
+            offsets[1:] = np.cumsum(lengths[:-1])
+        self.trajectory_offsets = offsets
+
+    def _get_start_state_idx(self, path_ind: int, start: int) -> int:
+        true_traj_idx = int(self.trajectory_index[path_ind])
+        if hasattr(self, "trajectory_offsets"):
+            return int(self.trajectory_offsets[true_traj_idx] + start)
+        return int(sum(self.map_back_lenghts[:true_traj_idx]) + start)
+
+    def _build_anchor_values(self, path_ind: int, start: int) -> np.ndarray:
+        anchor_values = np.zeros((Configs.horizon, 1), dtype=np.float32)
+        true_traj_idx = int(self.trajectory_index[path_ind])
+        path_len = int(self.map_back_lenghts[true_traj_idx])
+        if path_len <= 0:
+            return anchor_values
+
+        start_state_idx = self._get_start_state_idx(path_ind, start)
+        valid_len = max(0, min(Configs.horizon, path_len - int(start)))
+        if valid_len <= 0:
+            return anchor_values
+
+        end_state_idx = start_state_idx + valid_len
+        values = np.asarray(self.mixed_vs[start_state_idx:end_state_idx], dtype=np.float32).reshape(-1, 1)
+        anchor_values[:valid_len] = values[:valid_len]
+        if valid_len < Configs.horizon:
+            anchor_values[valid_len:] = anchor_values[valid_len - 1]
+        return anchor_values
         
     def load_data(self,):
-        
-        with open(f"dataset_infos/cluster_infos_{self.env_name.replace('-v2', f'-{Configs.expert_ratio:.2f}-v2')}.pkl", "rb") as f:
+        dataset_infos_path = getattr(Configs, "dataset_infos_path", "dataset_infos")
+        cluster_file = os.path.join(
+            dataset_infos_path,
+            f"cluster_infos_{self.env_name.replace('-v2', f'-{Configs.expert_ratio:.2f}-v2')}.pkl",
+        )
+        with open(cluster_file, "rb") as f:
             self.cluster_info = pkl.load(f) 
         
         self.calculate_similarity_in_cluster()
@@ -460,6 +497,7 @@ class MixDataset_plan2_hard(MixDataset_plan1_hard):
         
         self.map_back_lenghts = map_back_lenghts
         self.trajectory_index = trajectory_index
+        self._build_trajectory_offsets()
 
         for index, length in enumerate(map_back_lenghts):
             assert length == len(self.cluster_info['mixed_trajectories'][index]['observations'])
@@ -502,8 +540,7 @@ class MixDataset_plan2_hard(MixDataset_plan1_hard):
     # 只需要重载正样本的构建方式
     def get_positive_samples(self, path_ind, start,  end ):
 
-        true_traj_idx = self.trajectory_index[path_ind]
-        start_state_idx =  sum(self.map_back_lenghts[:true_traj_idx]) + start
+        start_state_idx = self._get_start_state_idx(path_ind, start)
 
         if start_state_idx in self.mixed_do_not_select_me:
             print("Found----------------------")
@@ -540,8 +577,17 @@ class MixDataset_plan2_hard(MixDataset_plan1_hard):
 
         positive_states, positive_rewards = self.get_positive_samples(path_ind, start,  end)
         negative_states, negative_rewards = self.get_negative_samples()
+        anchor_values = self._build_anchor_values(path_ind, start)
 
-        batch = Batch_plan14bf(trajectories, conditions, positive_states, negative_states, positive_rewards, negative_rewards, traj_rewards = self.placeholder)
+        batch = Batch_plan14bf(
+            trajectories,
+            conditions,
+            positive_states,
+            negative_states,
+            positive_rewards,
+            negative_rewards,
+            traj_rewards=anchor_values,
+        )
 
         return batch
 
@@ -560,8 +606,9 @@ class MixDataset_plan2_nomix(MixDataset_plan2_hard):
         return
 
     def load_data(self,):
-        
-        with open(f"dataset_infos/cluster_infos_{self.env_name}.pkl", "rb") as f:
+        dataset_infos_path = getattr(Configs, "dataset_infos_path", "dataset_infos")
+        cluster_file = os.path.join(dataset_infos_path, f"cluster_infos_{self.env_name}.pkl")
+        with open(cluster_file, "rb") as f:
             self.cluster_info = pkl.load(f) 
         
         self.calculate_similarity_in_cluster()
@@ -584,6 +631,7 @@ class MixDataset_plan2_nomix(MixDataset_plan2_hard):
         
         self.map_back_lenghts = map_back_lenghts
         self.trajectory_index = trajectory_index
+        self._build_trajectory_offsets()
 
         for index, length in enumerate(map_back_lenghts):
             assert length == len(self.cluster_info['mixed_trajectories'][index]['observations'])

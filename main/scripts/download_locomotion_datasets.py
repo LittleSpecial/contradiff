@@ -29,6 +29,7 @@ from typing import Dict, List, Sequence, Tuple
 THIS_FILE = Path(__file__).resolve()
 MAIN_DIR = THIS_FILE.parents[1]
 REPO_ROOT = THIS_FILE.parents[2]
+sys.path.append(str(MAIN_DIR))
 sys.path.append(str(REPO_ROOT))
 
 np = None
@@ -36,27 +37,68 @@ cdist = None
 MiniBatchKMeans = None
 load_environment = None
 sequence_dataset_mix = None
+d4rl_offline_dataset = None
+DATA_BACKEND = None
 
 
 def _lazy_imports() -> None:
-    global np, cdist, MiniBatchKMeans, load_environment, sequence_dataset_mix
+    global np, cdist, MiniBatchKMeans, load_environment, sequence_dataset_mix, d4rl_offline_dataset, DATA_BACKEND
     try:
         import numpy as _np  # type: ignore
         from scipy.spatial.distance import cdist as _cdist  # type: ignore
         from sklearn.cluster import MiniBatchKMeans as _MiniBatchKMeans  # type: ignore
-        from diffuser.datasets.d4rl import load_environment as _load_environment  # type: ignore
-        from diffuser.datasets.d4rl import sequence_dataset_mix as _sequence_dataset_mix  # type: ignore
     except Exception as e:
+        py = sys.executable
         raise SystemExit(
             "[ERR] Missing dependencies for dataset prep.\n"
-            "Please install: numpy, scipy, scikit-learn, gym, d4rl (and MuJoCo runtime).\n"
+            "Please install: numpy, scipy, scikit-learn.\n"
+            f"Try: {py} -m pip install numpy scipy scikit-learn\n"
             f"Original error: {type(e).__name__}: {e}"
         )
+
+    _load_environment = None
+    _sequence_dataset_mix = None
+    _d4rl_offline_dataset = None
+    backend = None
+    d4rl_import_error = None
+    just_d4rl_import_error = None
+
+    try:
+        from diffuser.datasets.d4rl import load_environment as __load_environment  # type: ignore
+        from diffuser.datasets.d4rl import sequence_dataset_mix as __sequence_dataset_mix  # type: ignore
+
+        _load_environment = __load_environment
+        _sequence_dataset_mix = __sequence_dataset_mix
+        backend = "d4rl"
+    except Exception as e:
+        d4rl_import_error = e
+
+    if backend is None:
+        try:
+            from just_d4rl import d4rl_offline_dataset as __d4rl_offline_dataset  # type: ignore
+
+            _d4rl_offline_dataset = __d4rl_offline_dataset
+            backend = "just_d4rl"
+        except Exception as e:
+            just_d4rl_import_error = e
+
+    if backend is None:
+        py = sys.executable
+        raise SystemExit(
+            "[ERR] No supported D4RL backend found.\n"
+            f"Option A (preferred): {py} -m pip install just-d4rl\n"
+            "Option B: install d4rl + gym + mujoco runtime.\n"
+            f"d4rl import error: {type(d4rl_import_error).__name__}: {d4rl_import_error}\n"
+            f"just-d4rl import error: {type(just_d4rl_import_error).__name__}: {just_d4rl_import_error}"
+        )
+
     np = _np
     cdist = _cdist
     MiniBatchKMeans = _MiniBatchKMeans
     load_environment = _load_environment
     sequence_dataset_mix = _sequence_dataset_mix
+    d4rl_offline_dataset = _d4rl_offline_dataset
+    DATA_BACKEND = backend
 
 
 def ensure_dir(path: Path) -> None:
@@ -72,6 +114,102 @@ def parse_ratio_arg(value: str) -> List[float]:
     for cell in parse_csv_arg(value):
         out.append(float(cell))
     return out
+
+
+def _max_episode_steps_for_env(env_full_name: str) -> int:
+    # D4RL locomotion tasks used by ContraDiff are all length-1000.
+    if env_full_name.startswith(("halfcheetah-", "hopper-", "walker2d-")):
+        return 1000
+    raise ValueError(f"Unsupported env for fallback backend: {env_full_name}")
+
+
+def _dataset_like_to_dict(dataset_like) -> Dict[str, np.ndarray]:
+    if isinstance(dataset_like, dict):
+        out = {}
+        for k, v in dataset_like.items():
+            out[k] = np.asarray(v)
+        return out
+
+    # best effort: object with attributes
+    keys = [k for k in dir(dataset_like) if not k.startswith("_")]
+    out: Dict[str, np.ndarray] = {}
+    for k in keys:
+        try:
+            v = getattr(dataset_like, k)
+        except Exception:
+            continue
+        if callable(v):
+            continue
+        try:
+            arr = np.asarray(v)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        out[k] = arr
+    return out
+
+
+def _sequence_dataset_mix_from_dataset_dict(dataset: Dict[str, np.ndarray], env_full_name: str) -> Tuple[List[Dict], Dict[str, np.ndarray]]:
+    rewards = np.asarray(dataset["rewards"]).reshape(-1)
+    terminals = np.asarray(dataset["terminals"]).reshape(-1)
+    n = int(rewards.shape[0])
+    max_episode_steps = _max_episode_steps_for_env(env_full_name)
+
+    use_timeouts = "timeouts" in dataset
+    timeouts = np.asarray(dataset.get("timeouts", np.zeros_like(terminals))).reshape(-1)
+
+    data_ = {}
+    all_data: List[Dict] = []
+    episode_step = 0
+    start = 0
+
+    keys = [k for k in dataset.keys() if "metadata" not in k]
+    for k in keys:
+        data_[k] = []
+
+    for i in range(n):
+        done_bool = bool(terminals[i])
+        if use_timeouts:
+            final_timestep = bool(timeouts[i])
+        else:
+            final_timestep = episode_step == (max_episode_steps - 1)
+
+        for k in keys:
+            data_[k].append(dataset[k][i])
+
+        if done_bool or final_timestep:
+            end = i
+            episode_data: Dict[str, np.ndarray] = {}
+            for k in data_.keys():
+                episode_data[k] = np.asarray(data_[k])
+            episode_data["start"] = int(start)
+            episode_data["end"] = int(end)
+            episode_data["accumulated_reward"] = float(np.sum(episode_data["rewards"]))
+            all_data.append(episode_data)
+            data_ = {k: [] for k in keys}
+            episode_step = 0
+            start = end + 1
+        else:
+            episode_step += 1
+
+    return all_data, dataset
+
+
+def _load_trajs_and_dataset(env_full_name: str) -> Tuple[List[Dict], Dict[str, np.ndarray], int]:
+    if DATA_BACKEND == "d4rl":
+        env = load_environment(env_full_name)
+        trajs, dataset = sequence_dataset_mix(env)
+        dataset = _dataset_like_to_dict(dataset)
+        return trajs, dataset, int(env.max_episode_steps)
+
+    if DATA_BACKEND == "just_d4rl":
+        dataset_like = d4rl_offline_dataset(env_full_name)
+        dataset = _dataset_like_to_dict(dataset_like)
+        trajs, dataset = _sequence_dataset_mix_from_dataset_dict(dataset, env_full_name)
+        return trajs, dataset, _max_episode_steps_for_env(env_full_name)
+
+    raise RuntimeError(f"Unknown DATA_BACKEND={DATA_BACKEND}")
 
 
 def calculate_vs_like_contradiff(dataset: Dict, max_path_length: int) -> List[float]:
@@ -113,9 +251,7 @@ def build_value_file(env_full_name: str, value_dir: Path, *, skip_existing: bool
         return out_file
 
     print(f"[value] building {env_full_name}")
-    env = load_environment(env_full_name)
-    _, dataset = sequence_dataset_mix(env)
-    max_path_length = int(env.max_episode_steps)
+    _, dataset, max_path_length = _load_trajs_and_dataset(env_full_name)
     values = calculate_vs_like_contradiff(dataset, max_path_length=max_path_length)
 
     with out_file.open("wb") as f:
@@ -136,8 +272,7 @@ def build_dataset_info(env_short: str, dataset_name: str, dataset_infos_dir: Pat
         raise FileNotFoundError(f"Missing value file: {value_file}")
 
     print(f"[dataset_info] building {env_full_name}")
-    env = load_environment(env_full_name)
-    trajs, dataset = sequence_dataset_mix(env)
+    trajs, dataset, _ = _load_trajs_and_dataset(env_full_name)
 
     with value_file.open("rb") as f:
         values_of_states = pkl.load(f)
@@ -200,8 +335,8 @@ def build_cluster_info(cfg: ClusterBuildConfig, dataset_infos_dir: Path, *, skip
     with orig_file.open("rb") as f:
         original_infos = pkl.load(f)
 
-    env_obj = load_environment(f"{cfg.env_short}-{cfg.dataset_name}-v2")
-    orig_trajs, _ = sequence_dataset_mix(env_obj)
+    orig_env_full_name = f"{cfg.env_short}-{cfg.dataset_name}-v2"
+    orig_trajs, _, _ = _load_trajs_and_dataset(orig_env_full_name)
 
     orig_states = np.asarray(original_infos["dataset"]["observations"], dtype=np.float32)
     orig_vs = np.asarray(original_infos["vlaues_of_states"], dtype=np.float32)
@@ -347,6 +482,7 @@ def main() -> None:
     print("=== ContraDiff locomotion data prep ===")
     print(json.dumps(
         {
+            "backend": DATA_BACKEND,
             "envs": envs,
             "datasets": datasets,
             "mix_datasets": mix_datasets,

@@ -387,7 +387,7 @@ class Planner_plan8a(Planner_plan7):
 
 import random
 def set_seed(seed):
-    if seed is not int:
+    if not isinstance(seed, int):
         Configs.logger.log(f"Skipinh to ste seed {seed}")
         return
     random.seed(seed)

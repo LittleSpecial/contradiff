@@ -15,14 +15,10 @@ import matplotlib
 matplotlib.use('Agg')
 import pickle as pkl
 import argparse
-import umap
 import copy
-from sklearn.manifold import TSNE
 from matplotlib.colors import Normalize
-from sklearn.metrics.pairwise import cosine_distances
 from scipy.spatial.distance import pdist, squareform
 from scipy.spatial.distance import cdist
-from sklearn.cluster import MiniBatchKMeans
 import inspect
 from operator import itemgetter
 from config.locomotion_config import Configs
@@ -31,6 +27,21 @@ from global_rendering import MuJoCoRenderer
 from dm_control.mujoco import engine
 from diffuser.datasets.d4rl import *
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
+# Optional heavy deps used by analysis/visualization helpers only.
+try:
+    import umap  # type: ignore
+except Exception:
+    umap = None
+
+try:
+    from sklearn.manifold import TSNE  # type: ignore
+    from sklearn.metrics.pairwise import cosine_distances  # type: ignore
+    from sklearn.cluster import MiniBatchKMeans  # type: ignore
+except Exception:
+    TSNE = None
+    cosine_distances = None
+    MiniBatchKMeans = None
 
 path = "/home/$USER/sync/CDiffuser/kitchen/logs"
 

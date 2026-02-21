@@ -23,8 +23,6 @@ import inspect
 from operator import itemgetter
 from config.locomotion_config import Configs
 import diffuser.utils as utils
-from global_rendering import MuJoCoRenderer
-from dm_control.mujoco import engine
 from diffuser.datasets.d4rl import *
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
@@ -42,6 +40,16 @@ except Exception:
     TSNE = None
     cosine_distances = None
     MiniBatchKMeans = None
+
+try:
+    from global_rendering import MuJoCoRenderer  # type: ignore
+except Exception:
+    MuJoCoRenderer = None
+
+try:
+    from dm_control.mujoco import engine  # type: ignore
+except Exception:
+    engine = None
 
 path = "/home/$USER/sync/CDiffuser/kitchen/logs"
 

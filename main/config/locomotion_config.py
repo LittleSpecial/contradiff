@@ -1,10 +1,6 @@
 from typing import Any
 import torch
 import os
-try:
-    from params_proto.neo_proto import ParamsProto, PrefixProto, Proto
-except Exception:
-    from params_proto import ParamsProto, PrefixProto, Proto
 import json
 import copy
 

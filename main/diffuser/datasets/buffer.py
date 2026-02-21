@@ -80,7 +80,8 @@ class ReplayBuffer:
 
         ## penalize early termination
         if path['terminals'].any() and self.termination_penalty is not None:
-            assert not path['timeouts'].any(), 'Penalized a timeout episode for early termination'
+            has_timeouts = bool(path.get('timeouts', np.array([False])).any())
+            assert not has_timeouts, 'Penalized a timeout episode for early termination'
             self._dict['rewards'][self._count, path_length - 1] += self.termination_penalty
 
         ## record path length

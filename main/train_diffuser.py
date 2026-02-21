@@ -29,6 +29,41 @@ print(f"Changing working dir to {path}.")
 import matplotlib
 matplotlib.use('Agg')
 
+
+def _apply_env_overrides(args):
+    """Allow Slurm wrappers to override config-only fields without CLI args."""
+    specs = [
+        ("RENDERER", "renderer", str),
+        ("N_DIFFUSION_STEPS", "n_diffusion_steps", int),
+        ("MAX_STEPS", "n_train_steps", int),
+        ("EVAL_INTERVAL", "sample_freq", int),
+        ("SAVE_INTERVAL", "save_freq", int),
+        ("LEARNING_RATE", "learning_rate", float),
+        ("DATASET_INFOS_PATH", "dataset_infos_path", str),
+        ("VALUE_OF_STATES_PATH", "value_of_states_path", str),
+        ("USE_COUNTERFACTUAL_CREDIT", "use_counterfactual_credit", int),
+        ("COUNTERFACTUAL_K", "counterfactual_k", int),
+        ("CREDIT_WEIGHT_MODE", "credit_weight_mode", str),
+        ("CREDIT_WEIGHT_NORM", "credit_weight_norm", str),
+        ("CREDIT_WEIGHT_ALPHA", "credit_weight_alpha", float),
+        ("CREDIT_WEIGHT_MIN", "credit_weight_min", float),
+        ("CREDIT_WEIGHT_MAX", "credit_weight_max", float),
+        ("CREDIT_WEIGHT_ON_DIFFUSION", "credit_weight_on_diffusion", int),
+        ("CREDIT_WEIGHT_ON_CONTRAST", "credit_weight_on_contrast", int),
+    ]
+    for env_key, attr, caster in specs:
+        raw = os.environ.get(env_key, "")
+        if raw == "":
+            continue
+        old_val = getattr(args, attr, None)
+        try:
+            new_val = caster(raw)
+        except Exception:
+            print(f"[train_diffuser] skip invalid env override {env_key}={raw}")
+            continue
+        setattr(args, attr, new_val)
+        print(f"[train_diffuser] override {attr}: {old_val} -> {new_val} (from {env_key})")
+
 def sync_dict(args):
 
     for k in args._dict.keys():
@@ -45,6 +80,7 @@ def train_diffusion():
     
 
     args = args.parse_args('diffusion')
+    _apply_env_overrides(args)
     if args.horizon == 4:
         args.dim_mults = (1,4,8)
     elif args.horizon == 32:

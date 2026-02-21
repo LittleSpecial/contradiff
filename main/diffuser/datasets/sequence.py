@@ -30,8 +30,6 @@ from config.locomotion_config import Configs
 from tqdm import tqdm
 import pickle
 import copy
-import umap
-from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 import random
 import inspect

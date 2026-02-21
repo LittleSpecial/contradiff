@@ -5,7 +5,6 @@ import imageio
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import gym
-import mujoco_py as mjc
 import warnings
 import pdb
 
@@ -14,6 +13,14 @@ from .video import save_video, save_videos
 
 from diffuser.datasets.d4rl import load_environment
 from config.locomotion_config import Configs
+
+try:
+    import mujoco_py as mjc
+except Exception as e:
+    mjc = None
+    _MUJOCO_IMPORT_ERROR = e
+else:
+    _MUJOCO_IMPORT_ERROR = None
 #-----------------------------------------------------------------------------#
 #------------------------------- helper structs ------------------------------#
 #-----------------------------------------------------------------------------#
@@ -50,12 +57,45 @@ def atmost_2d(x):
 #---------------------------------- renderers --------------------------------#
 #-----------------------------------------------------------------------------#
 
+class NullRenderer:
+    """No-op renderer for environments where mujoco_py is unavailable."""
+
+    def __init__(self, env=None, *args, **kwargs):
+        self.env = env
+
+    def render(self, *args, dim=256, **kwargs):
+        if isinstance(dim, int):
+            dim = (dim, dim)
+        return np.zeros((*dim, 3), dtype=np.uint8)
+
+    def renders(self, *args, dim=256, **kwargs):
+        return self.render(dim=dim)
+
+    def composite(self, savepath=None, paths=None, dim=(256, 256), **kwargs):
+        image = np.zeros((*dim, 3), dtype=np.uint8)
+        if savepath is not None:
+            imageio.imsave(savepath, image)
+        return image
+
+    def render_rollout(self, *args, **kwargs):
+        return None
+
+    def render_plan(self, *args, **kwargs):
+        return None
+
+    def render_diffusion(self, *args, **kwargs):
+        return None
+
 class MuJoCoRenderer:
     '''
         default mujoco renderer
     '''
 
     def __init__(self, env):
+        if mjc is None:
+            raise ImportError(
+                f"mujoco_py is unavailable: {_MUJOCO_IMPORT_ERROR}"
+            )
         self.deviceid = int(Configs.device[-1])
         if type(env) is str:
             env = env_map(env)

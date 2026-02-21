@@ -26,6 +26,31 @@ print(f"Changing working dir to {path}.")
 import matplotlib
 matplotlib.use('Agg')
 
+
+def _apply_env_overrides(args):
+    """Allow Slurm scripts to override config-only fields without CLI support."""
+    specs = [
+        ("VALUE_RENDERER", "renderer", str),
+        ("N_DIFFUSION_STEPS", "n_diffusion_steps", int),
+        ("VALUE_STEPS", "n_train_steps", int),
+        ("SAVE_INTERVAL", "save_freq", int),
+        ("LEARNING_RATE", "learning_rate", float),
+        ("VALUE_BATCH_SIZE", "batch_size", int),
+        ("LOG_INTERVAL", "log_freq", int),
+    ]
+    for env_key, attr, caster in specs:
+        raw = os.environ.get(env_key, "")
+        if raw == "":
+            continue
+        old_val = getattr(args, attr, None)
+        try:
+            new_val = caster(raw)
+        except Exception:
+            print(f"[train_values] skip invalid env override {env_key}={raw}")
+            continue
+        setattr(args, attr, new_val)
+        print(f"[train_values] override {attr}: {old_val} -> {new_val} (from {env_key})")
+
 def sync_dict(args):
 
     for k in args._dict.keys():
@@ -43,6 +68,7 @@ def train_value():
     args = Parser()
 
     args = args.parse_args('values')
+    _apply_env_overrides(args)
     if args.horizon == 4:
         args.dim_mults = (1,4,8)
     elif args.horizon == 32:
